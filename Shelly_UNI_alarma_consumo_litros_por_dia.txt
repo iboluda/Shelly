@@ -1,0 +1,94 @@
+let CONFIG = {
+  counterId: 2,               // input:2 es el contador
+  switchId: 0,                // switch:0 o switch:1 según conexión
+  volumeThresholdLitros: 2000, // ✅ Umbral en litros
+  litrosPorPulso: 0.002525,     // YF-B5: 1 pulso = 0.002525 litros
+  notifyMessage: "🔔 Umbral diario de agua superado",
+  autoOffSeconds: 10,
+  snapshotHour: 0,
+  snapshotMinute: 0,
+  timezoneOffset: 2 * 3600    // UTC+2 (verano); cambia a 1*3600 en invierno
+};
+
+let dailyStartCount = null;
+
+// 👉 Captura el valor actual al arrancar el script
+Shelly.call("Input.GetStatus", { id: CONFIG.counterId }, function (res, ec, em) {
+  if (ec) {
+    print("❌ Error al obtener el contador inicial:", em);
+    return;
+  }
+  dailyStartCount = res.counts.total;
+  print("📌 Valor inicial registrado al arrancar:", dailyStartCount);
+});
+
+Shelly.addStatusHandler(function (status) {
+  if (status.component === "input:" + CONFIG.counterId && status.delta && status.delta.counts) {
+    let pulseCount = status.delta.counts.total;
+    print("📈 Pulsos contados:", pulseCount);
+
+    if (dailyStartCount === null) {
+      print("⏳ Aún no se ha capturado dailyStartCount");
+      return;
+    }
+
+    let incrementoPulsos = pulseCount - dailyStartCount;
+    let litrosConsumidos = incrementoPulsos * CONFIG.litrosPorPulso;
+
+    print("📊 Litros desde inicio:", litrosConsumidos.toFixed(2));
+
+    if (litrosConsumidos >= CONFIG.volumeThresholdLitros) {
+      print("🔔 Umbral de litros alcanzado:", CONFIG.volumeThresholdLitros, "L");
+
+      Shelly.emitEvent("umbral_agua_superado", {
+        mensaje: CONFIG.notifyMessage,
+        litros: litrosConsumidos,
+        umbral: CONFIG.volumeThresholdLitros,
+        timestamp: Shelly.getComponentStatus("sys").unixtime
+      });
+
+      Shelly.call("switch.set", { id: CONFIG.switchId, on: true });
+      print("⚡ Salida activada");
+
+      Timer.set(CONFIG.autoOffSeconds * 1000, false, function () {
+        Shelly.call("switch.set", { id: CONFIG.switchId, on: false });
+        print("⏱️ Salida desactivada tras", CONFIG.autoOffSeconds, "segundos");
+      });
+    }
+  }
+});
+
+// 🕛 Programar snapshot a las 00:00 para el día siguiente
+function scheduleDailySnapshot() {
+  Shelly.call("Sys.GetStatus", {}, function (result, error_code, error_msg) {
+    if (error_code || !result.unixtime) {
+      print("❌ Error al obtener la hora del sistema:", error_msg);
+      return;
+    }
+
+    let now = result.unixtime + CONFIG.timezoneOffset;
+    let nowSecondsToday = now % 86400;
+    let snapshotSeconds = CONFIG.snapshotHour * 3600 + CONFIG.snapshotMinute * 60;
+
+    let waitSeconds = nowSecondsToday < snapshotSeconds
+      ? snapshotSeconds - nowSecondsToday
+      : 86400 - nowSecondsToday + snapshotSeconds;
+
+    print("⏳ Segundos hasta la próxima snapshot (00:00):", waitSeconds);
+
+    Timer.set(waitSeconds * 1000, false, function () {
+      Shelly.call("Input.GetStatus", { id: CONFIG.counterId }, function (res, ec, em) {
+        if (ec) {
+          print("❌ Error al obtener el contador:", em);
+          return;
+        }
+        dailyStartCount = res.counts.total;
+        print("📌 Snapshot a las 00:00. Nuevo dailyStartCount:", dailyStartCount);
+        scheduleDailySnapshot();  // Reprogramar para el día siguiente
+      });
+    });
+  });
+}
+
+print("🚀 Script iniciado. Monitoreando volumen desde arranque en input:" + CONFIG.counterId);
+scheduleDailySnapshot();
